@@ -189,8 +189,9 @@ try {
 
     # --- 3. Try default UniFi credentials, push set-inform on success ---
     $credPairs = @(
-        @{ User = "ubnt"; Pass = "ubnt" },   # older devices
-        @{ User = "ui";   Pass = "ui" }      # newer devices
+        @{ User = "ui";   Pass = "ui" },      # newer devices
+        @{ User = "ubnt"; Pass = "ubnt" }   # older devices
+
     )
 
     $adoptedCount = 0
@@ -221,7 +222,7 @@ try {
             if ($result.TimedOut) {
                 Log "     TIMED OUT waiting for a response from $ip - moving on. (Check the laptop's firewall/antivirus isn't blocking plink.exe or outbound SSH.)"
             } elseif (-not $authFailed) {
-                Log "  -> ${ip}: logged in and sent set-inform (exit code $exitCode)."
+                Log "  -> ${ip}: logged in and sent set-inform **DEVICE SUCCESSFULLY SWAT INFORMED** (exit code $exitCode)."
                 if ($outputText -match "not found") {
                     Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device."
                 }
