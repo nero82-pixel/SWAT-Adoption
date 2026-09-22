@@ -1,0 +1,252 @@
+# ============================================================
+#  Swat Cloud UniFi Auto-Adopt Tool
+#  Detects the local subnet, scans for factory-default UniFi
+#  devices, and pushes set-inform to point them at:
+#    http://swatcloud.swatunifi.com:8080/inform
+#
+#  Requires nmap.exe and plink.exe in the SAME folder as this
+#  script (see README.txt).
+# ============================================================
+
+$informUrl = "http://swatcloud.swatunifi.com:8080/inform"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$nmapExe   = Join-Path $scriptDir "nmap.exe"
+$plinkExe  = Join-Path $scriptDir "plink.exe"
+$logFile   = Join-Path $scriptDir ("adoption-log-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
+
+function Log {
+    param([string]$msg)
+    $line = "$(Get-Date -Format 'HH:mm:ss')  $msg"
+    Write-Host $line
+    Add-Content -Path $logFile -Value $line
+}
+
+function New-PlinkSession {
+    # Starts plink with its output captured asynchronously into a thread-safe
+    # buffer, so we can poll for a response the moment it arrives instead of
+    # blindly sleeping for a fixed worst-case duration.
+    param([string]$PlinkPath, [string]$ArgsLine)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $PlinkPath
+    $psi.Arguments              = $ArgsLine
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.EnableRaisingEvents = $true
+
+    $buffer = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    $action = { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add($EventArgs.Data) } }
+    $outSub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action $action -MessageData $buffer
+    $errSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -Action $action -MessageData $buffer
+
+    [void]$proc.Start()
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    return [PSCustomObject]@{ Process = $proc; Buffer = $buffer; OutSub = $outSub; ErrSub = $errSub }
+}
+
+function Get-SessionText { param($Session) return ($Session.Buffer -join "`n") }
+
+function Wait-ForSessionPattern {
+    # Polls every $PollMs until $Pattern shows up in the session's output,
+    # or $TimeoutMs elapses - whichever is first. Returns as soon as it
+    # sees a real answer rather than waiting out the full timeout every time.
+    param($Session, [string]$Pattern, [int]$TimeoutMs, [int]$PollMs = 150)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        if ((Get-SessionText $Session) -match $Pattern) { return $true }
+        if ($Session.Process.HasExited) { break }
+        Start-Sleep -Milliseconds $PollMs
+    }
+    return (Get-SessionText $Session) -match $Pattern
+}
+
+function Close-PlinkSession {
+    param($Session)
+    try { if (-not $Session.Process.HasExited) { $Session.Process.Kill() } } catch {}
+    try { Unregister-Event -SourceIdentifier $Session.OutSub.Name -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-Event -SourceIdentifier $Session.ErrSub.Name -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $Session.OutSub -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $Session.ErrSub -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+function Invoke-PlinkInteractive {
+    param(
+        [string]$PlinkPath,
+        [string]$IpAddress,
+        [string]$User,
+        [string]$Pass,
+        [string[]]$Commands,
+        [int]$ConnectTimeoutMs  = 5000,   # cap while waiting for a host-key prompt / auth result / banner
+        [int]$CommandGapMs      = 700,    # pause between typed commands once logged in
+        [int]$OverallTimeoutMs  = 9000    # absolute worst-case cap for the whole session
+    )
+
+    $session = New-PlinkSession -PlinkPath $PlinkPath -ArgsLine "-ssh -pw `"$Pass`" `"$User@$IpAddress`""
+
+    # Wait for whichever comes first: an unknown-host-key prompt, an auth
+    # rejection, or the device's own login banner (meaning auth succeeded).
+    Wait-ForSessionPattern -Session $session -TimeoutMs $ConnectTimeoutMs `
+        -Pattern "(Store key in cache|Access denied|FATAL ERROR|not accepted|Welcome to)" | Out-Null
+    $text = Get-SessionText $session
+
+    if ($text -match "Store key in cache") {
+        try { $session.Process.StandardInput.WriteLine("y"); $session.Process.StandardInput.Flush() } catch {}
+        # This device has never been trusted before - now wait for the real
+        # outcome (auth rejection or banner) that follows the key acceptance.
+        Wait-ForSessionPattern -Session $session -TimeoutMs $ConnectTimeoutMs `
+            -Pattern "(Access denied|FATAL ERROR|not accepted|Welcome to)" | Out-Null
+        $text = Get-SessionText $session
+    }
+
+    if ($text -notmatch "Access denied|FATAL ERROR|not accepted") {
+        foreach ($cmd in $Commands) {
+            try { $session.Process.StandardInput.WriteLine($cmd); $session.Process.StandardInput.Flush() } catch {}
+            Start-Sleep -Milliseconds $CommandGapMs
+        }
+        try {
+            $session.Process.StandardInput.WriteLine("exit")
+            $session.Process.StandardInput.Flush()
+            $session.Process.StandardInput.Close()
+        } catch {}
+    }
+
+    $exited = $session.Process.WaitForExit($OverallTimeoutMs)
+    $exitCode = -1
+    if ($exited) { $exitCode = $session.Process.ExitCode }
+    $finalText = Get-SessionText $session
+
+    Close-PlinkSession $session
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output   = $finalText
+        TimedOut = -not $exited
+    }
+}
+
+try {
+    Log "=== Swat Cloud UniFi Auto-Adopt Tool ==="
+    Log "Inform URL: $informUrl"
+    Log "Script folder: $scriptDir"
+
+    # --- 0. Sanity check the required tools are present ---
+    if (-not (Test-Path $nmapExe)) {
+        Log "ERROR: nmap.exe not found in this folder. Copy it in alongside this script and try again."
+        return
+    }
+    if (-not (Test-Path $plinkExe)) {
+        Log "ERROR: plink.exe not found in this folder. Copy it in alongside this script and try again."
+        return
+    }
+
+    # --- 1. Detect the active local subnet (varies per site) ---
+    $activeConfig = Get-NetIPConfiguration -ErrorAction Stop | Where-Object {
+        $_.IPv4DefaultGateway -ne $null -and
+        $_.NetAdapter.Status -eq "Up"
+    } | Select-Object -First 1
+
+    if (-not $activeConfig) {
+        Log "ERROR: Could not detect an active network connection."
+        Log "Make sure this laptop is connected to the site network (wired or WiFi) and try again."
+        return
+    }
+
+    $ipAddress    = $activeConfig.IPv4Address.IPAddress
+    $prefixLength = $activeConfig.IPv4Address.PrefixLength
+    $cidr         = "$ipAddress/$prefixLength"
+
+    Log "Detected local network: $cidr  (adapter: $($activeConfig.InterfaceAlias))"
+
+    # --- 2. Scan for hosts with SSH open (factory-default UniFi devices) ---
+    Log "Scanning $cidr for UniFi devices... this can take a minute or two."
+    $nmapOutput = & $nmapExe -p 22 --open -oG - $cidr 2>&1
+    Log "nmap exit code: $LASTEXITCODE"
+
+    $targets = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $nmapOutput) {
+        if ($line -match "^Host:\s+(\d+\.\d+\.\d+\.\d+).*Ports:\s+22/open") {
+            $targets.Add($matches[1])
+        }
+    }
+
+    if ($targets.Count -eq 0) {
+        Log "No devices with SSH open were found on $cidr."
+        Log "Nothing to adopt right now. If you expected devices here, double-check they're powered on and on this same network."
+        Log "--- Raw nmap output (for troubleshooting) ---"
+        foreach ($line in $nmapOutput) { Log "    $line" }
+        return
+    }
+
+    Log "Found $($targets.Count) candidate device(s): $($targets -join ', ')"
+
+    # --- 3. Try default UniFi credentials, push set-inform on success ---
+    $credPairs = @(
+        @{ User = "ubnt"; Pass = "ubnt" },   # older devices
+        @{ User = "ui";   Pass = "ui" }      # newer devices
+    )
+
+    $adoptedCount = 0
+
+    foreach ($ip in $targets) {
+        $adopted = $false
+        foreach ($cred in $credPairs) {
+            Log "Trying $ip with $($cred.User)/$($cred.Pass)..."
+
+            # Open a real interactive session and TYPE the commands in with
+            # pauses between each, the way a human at a terminal would.
+            # Some newer UniFi firmware only recognises "set-inform" inside
+            # its interactive management shell - and needs time to reach a
+            # prompt before it will accept any input at all.
+            $result = Invoke-PlinkInteractive -PlinkPath $plinkExe -IpAddress $ip `
+                -User $cred.User -Pass $cred.Pass `
+                -Commands @("set-inform $informUrl", "set-inform $informUrl")
+
+            $exitCode   = $result.ExitCode
+            $outputText = $result.Output
+
+            $authFailed = ($outputText -match "Access denied") -or
+                          ($outputText -match "not accepted") -or
+                          ($outputText -match "No supported authentication")
+
+            Add-Content -Path $logFile -Value "----- Full transcript for $ip ($($cred.User)/$($cred.Pass)) -----`n$outputText`n----- End transcript -----"
+
+            if ($result.TimedOut) {
+                Log "     TIMED OUT waiting for a response from $ip - moving on. (Check the laptop's firewall/antivirus isn't blocking plink.exe or outbound SSH.)"
+            } elseif (-not $authFailed) {
+                Log "  -> ${ip}: logged in and sent set-inform (exit code $exitCode)."
+                if ($outputText -match "not found") {
+                    Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device."
+                }
+                $adopted = $true
+                $adoptedCount++
+                break
+            } else {
+                Log "     (exit code $exitCode) - auth rejected, see log file for full transcript"
+            }
+        }
+        if (-not $adopted) {
+            Log "  -> Could not log into $ip with default credentials (it may already be adopted, or has custom credentials)."
+        }
+    }
+
+    Log "=== Done. $adoptedCount of $($targets.Count) device(s) were sent set-inform. ==="
+    Log "Check the Swat Cloud console - devices should now show 'Pending Adoption' within a minute or two."
+    Log "Full log saved to: $logFile"
+}
+catch {
+    Log "!!! UNEXPECTED ERROR !!!"
+    Log $_.Exception.Message
+    Log $_.ScriptStackTrace
+}
+finally {
+    Write-Host ""
+    Read-Host "Press Enter to close"
+}
