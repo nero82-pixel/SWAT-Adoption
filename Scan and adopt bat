@@ -138,10 +138,9 @@ function Invoke-PlinkInteractive {
 }
 
 try {
-    Log "=== Swat Cloud UniFi Auto-Adopt Tool ==="
+    Log "=== SWATCloud UniFi Auto-Adopt Tool ==="
     Log "Inform URL: $informUrl"
     Log "Script folder: $scriptDir"
-    Log "PowerShell language mode: $($ExecutionContext.SessionState.LanguageMode)"
 
     # --- 0. Sanity check the required tools are present ---
     if (-not (Test-Path $nmapExe)) {
@@ -172,9 +171,8 @@ try {
     Log "Detected local network: $cidr  (adapter: $($activeConfig.InterfaceAlias))"
 
     # --- 2. Scan for hosts with SSH open (factory-default UniFi devices) ---
-    Log "Scanning $cidr for UniFi devices... this can take a minute or two."
+    Log "Scanning for devices with SSH... this can take a minute or two."
     $nmapOutput = & $nmapExe -Pn -p 22 --open -oG - $cidr 2>&1
-    Log "nmap exit code: $LASTEXITCODE"
 
     $targets = New-Object System.Collections.Generic.List[string]
     foreach ($line in $nmapOutput) {
@@ -191,12 +189,13 @@ try {
         return
     }
 
-    Log "Found $($targets.Count) candidate device(s): $($targets -join ', ')"
+    Log "Found $($targets.Count) candidate device(s), attempting to set inform on each: $($targets -join ', ')"
 
     # --- 3. Try default UniFi credentials, push set-inform on success ---
     $credPairs = @(
-        @{ User = "ubnt"; Pass = "ubnt" },   # older devices
-        @{ User = "ui";   Pass = "ui" }      # newer devices
+        @{ User = "ui";   Pass = "ui" },      # newer devices
+        @{ User = "ubnt"; Pass = "ubnt" }   # older devices
+
     )
 
     $adoptedCount = 0
@@ -227,7 +226,7 @@ try {
             if ($result.TimedOut) {
                 Log "     TIMED OUT waiting for a response from $ip - moving on. (Check the laptop's firewall/antivirus isn't blocking plink.exe or outbound SSH.)"
             } elseif (-not $authFailed) {
-                Log "  -> ${ip}: logged in and sent set-inform (exit code $exitCode)."
+                Log "  -> ${ip}: logged in and sent set-inform to SWAT CLOUD."
                 if ($outputText -match "not found") {
                     Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device."
                 }
@@ -235,15 +234,15 @@ try {
                 $adoptedCount++
                 break
             } else {
-                Log "     (exit code $exitCode) - auth rejected, see log file for full transcript"
+                Log "     (exit code $exitCode) - Computer says no. Login rejected."
             }
         }
         if (-not $adopted) {
-            Log "  -> Could not log into $ip with default credentials (it may already be adopted, or has custom credentials)."
+            Log "  -> Could not log into $ip."
         }
     }
 
-    Log "=== Done. $adoptedCount of $($targets.Count) device(s) were sent set-inform. ==="
+    Log "=== Done. $adoptedCount of $($targets.Count) device(s) were sent set-inform to SWAT CLOUD. ==="
     Log "Check the Swat Cloud console - devices should now show 'Pending Adoption' within a minute or two."
     Log "Full log saved to: $logFile"
 }
@@ -254,5 +253,5 @@ catch {
 }
 finally {
     Write-Host ""
-    Read-Host "Press Enter to close"
+    Read-Host "Finished, close window and see log for more details."
 }
