@@ -22,9 +22,14 @@ function Log {
 }
 
 function New-PlinkSession {
-    # Starts plink with its output captured asynchronously into a thread-safe
-    # buffer, so we can poll for a response the moment it arrives instead of
-    # blindly sleeping for a fixed worst-case duration.
+    # Talks to plink DIRECTLY (no cmd.exe wrapper, no file redirection) using
+    # .NET's own async pipe-based output capture. Combined with a real,
+    # visible window (CreateNoWindow = $false) - plink's interactive
+    # host-key prompt appears to need an actual console to behave properly
+    # on some machines; without one, its prompt text doesn't reliably reach
+    # a redirected file OR a redirected pipe. With a real window present,
+    # plink runs normally, and .NET's redirected streams still let us read
+    # and answer it programmatically instead of a human having to type.
     param([string]$PlinkPath, [string]$ArgsLine)
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -34,7 +39,7 @@ function New-PlinkSession {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
     $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
+    $psi.CreateNoWindow         = $false
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
@@ -54,6 +59,15 @@ function New-PlinkSession {
 
 function Get-SessionText { param($Session) return ($Session.Buffer -join "`n") }
 
+function Close-PlinkSession {
+    param($Session)
+    try { if (-not $Session.Process.HasExited) { $Session.Process.Kill() } } catch {}
+    try { Unregister-Event -SourceIdentifier $Session.OutSub.Name -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-Event -SourceIdentifier $Session.ErrSub.Name -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $Session.OutSub -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $Session.ErrSub -Force -ErrorAction SilentlyContinue } catch {}
+}
+
 function Wait-ForSessionPattern {
     # Polls every $PollMs until $Pattern shows up in the session's output,
     # or $TimeoutMs elapses - whichever is first. Returns as soon as it
@@ -66,15 +80,6 @@ function Wait-ForSessionPattern {
         Start-Sleep -Milliseconds $PollMs
     }
     return (Get-SessionText $Session) -match $Pattern
-}
-
-function Close-PlinkSession {
-    param($Session)
-    try { if (-not $Session.Process.HasExited) { $Session.Process.Kill() } } catch {}
-    try { Unregister-Event -SourceIdentifier $Session.OutSub.Name -ErrorAction SilentlyContinue } catch {}
-    try { Unregister-Event -SourceIdentifier $Session.ErrSub.Name -ErrorAction SilentlyContinue } catch {}
-    try { Remove-Job $Session.OutSub -Force -ErrorAction SilentlyContinue } catch {}
-    try { Remove-Job $Session.ErrSub -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 function Invoke-PlinkInteractive {
@@ -136,6 +141,7 @@ try {
     Log "=== Swat Cloud UniFi Auto-Adopt Tool ==="
     Log "Inform URL: $informUrl"
     Log "Script folder: $scriptDir"
+    Log "PowerShell language mode: $($ExecutionContext.SessionState.LanguageMode)"
 
     # --- 0. Sanity check the required tools are present ---
     if (-not (Test-Path $nmapExe)) {
@@ -167,7 +173,7 @@ try {
 
     # --- 2. Scan for hosts with SSH open (factory-default UniFi devices) ---
     Log "Scanning $cidr for UniFi devices... this can take a minute or two."
-    $nmapOutput = & $nmapExe -p 22 --open -oG - $cidr 2>&1
+    $nmapOutput = & $nmapExe -Pn -p 22 --open -oG - $cidr 2>&1
     Log "nmap exit code: $LASTEXITCODE"
 
     $targets = New-Object System.Collections.Generic.List[string]
@@ -189,9 +195,8 @@ try {
 
     # --- 3. Try default UniFi credentials, push set-inform on success ---
     $credPairs = @(
-        @{ User = "ui";   Pass = "ui" },      # newer devices
-        @{ User = "ubnt"; Pass = "ubnt" }   # older devices
-
+        @{ User = "ubnt"; Pass = "ubnt" },   # older devices
+        @{ User = "ui";   Pass = "ui" }      # newer devices
     )
 
     $adoptedCount = 0
@@ -222,7 +227,7 @@ try {
             if ($result.TimedOut) {
                 Log "     TIMED OUT waiting for a response from $ip - moving on. (Check the laptop's firewall/antivirus isn't blocking plink.exe or outbound SSH.)"
             } elseif (-not $authFailed) {
-                Log "  -> ${ip}: logged in and sent set-inform **DEVICE SUCCESSFULLY SWAT INFORMED** (exit code $exitCode)."
+                Log "  -> ${ip}: logged in and sent set-inform (exit code $exitCode)."
                 if ($outputText -match "not found") {
                     Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device."
                 }
