@@ -15,9 +15,12 @@ $plinkExe  = Join-Path $scriptDir "plink.exe"
 $logFile   = Join-Path $scriptDir ("adoption-log-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
 
 function Log {
-    param([string]$msg)
+    param(
+        [string]$msg,
+        [string]$Color = "White"
+    )
     $line = "$(Get-Date -Format 'HH:mm:ss')  $msg"
-    Write-Host $line
+    Write-Host $line -ForegroundColor $Color
     Add-Content -Path $logFile -Value $line
 }
 
@@ -138,18 +141,18 @@ function Invoke-PlinkInteractive {
 }
 
 try {
-    Log "=== SWATCloud UniFi Auto-Adopt Tool ==="
-    Log "Inform URL: $informUrl"
-    Log "Script folder: $scriptDir"
+    Log "=== SWATCloud UniFi Auto-Adopt Tool ===" -Color Blue
+    Log "Inform URL: $informUrl" -Color Cyan
+    Log "Script folder: $scriptDir" -Color Cyan
 
     # --- 0. Sanity check the required tools are present ---
     if (-not (Test-Path $nmapExe)) {
         Log "ERROR: nmap.exe not found in this folder. Copy it in alongside this script and try again."
-        return
+        return -Color Red
     }
     if (-not (Test-Path $plinkExe)) {
         Log "ERROR: plink.exe not found in this folder. Copy it in alongside this script and try again."
-        return
+        return -Color Red
     }
 
     # --- 1. Detect the active local subnet (varies per site) ---
@@ -168,10 +171,10 @@ try {
     $prefixLength = $activeConfig.IPv4Address.PrefixLength
     $cidr         = "$ipAddress/$prefixLength"
 
-    Log "Detected local network: $cidr  (adapter: $($activeConfig.InterfaceAlias))"
+    Log "Detected local network: $cidr  (adapter: $($activeConfig.InterfaceAlias))" -Color Cyan
 
     # --- 2. Scan for hosts with SSH open (factory-default UniFi devices) ---
-    Log "Scanning for devices with SSH... this can take a minute or two."
+    Log "Scanning for devices with SSH... this can take a minute or two." -Color Cyan
     $nmapOutput = & $nmapExe -Pn -p 22 --open -oG - $cidr 2>&1
 
     $targets = New-Object System.Collections.Generic.List[string]
@@ -189,7 +192,7 @@ try {
         return
     }
 
-    Log "Found $($targets.Count) candidate device(s), attempting to set inform on each: $($targets -join ', ')"
+    Log "Found $($targets.Count) candidate device(s), attempting to set inform on each: $($targets -join ', ')" -Color Green
 
     # --- 3. Try default UniFi credentials, push set-inform on success ---
     $credPairs = @(
@@ -226,7 +229,7 @@ try {
             if ($result.TimedOut) {
                 Log "     TIMED OUT waiting for a response from $ip - moving on. (Check the laptop's firewall/antivirus isn't blocking plink.exe or outbound SSH.)"
             } elseif (-not $authFailed) {
-                Log "  -> ${ip}: logged in and sent set-inform to SWAT CLOUD."
+                Log "  -> ${ip}: logged in and sent set-inform to SWAT CLOUD." -Color Green
                 if ($outputText -match "not found") {
                     Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device."
                 }
@@ -234,17 +237,17 @@ try {
                 $adoptedCount++
                 break
             } else {
-                Log "     (exit code $exitCode) - Computer says no. Login rejected."
+                Log "     (exit code $exitCode) - Computer says no. Login rejected." -Color Yellow
             }
         }
         if (-not $adopted) {
-            Log "  -> Could not log into $ip."
+            Log "  -> Could not log into $ip." -Color Red
         }
     }
 
-    Log "=== Done. $adoptedCount of $($targets.Count) device(s) were sent set-inform to SWAT CLOUD. ==="
-    Log "Check the Swat Cloud console - devices should now show 'Pending Adoption' within a minute or two."
-    Log "Full log saved to: $logFile"
+    Log "=== Done. $adoptedCount of $($targets.Count) device(s) were sent set-inform to SWAT CLOUD. ===" -Color Green
+    Log "Check the Swat Cloud console - devices should now show 'Pending Adoption' within a minute or two." -Color Green
+    Log "Full log saved to: $logFile" -Color Cyan
 }
 catch {
     Log "!!! UNEXPECTED ERROR !!!"
