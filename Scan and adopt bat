@@ -1,88 +1,281 @@
 # ============================================================
-#  Swat Cloud UniFi Auto-Adopt Tool
-#  Detects the local subnet, scans for factory-default UniFi
-#  devices, and pushes set-inform to point them at:
-#    http://swatcloud.swatunifi.com:8080/inform
+# Swat Cloud UniFi Auto-Adopt Tool
 #
-#  Requires nmap.exe and plink.exe in the SAME folder as this
-#  script (see README.txt).
+# Detects the local subnet, scans for factory-default UniFi
+# devices, and pushes set-inform to:
+#   http://swatcloud.swatunifi.com:8080/inform
+#
+# Requires nmap.exe and plink.exe in the same folder.
+#
+# SSH HOST KEY HANDLING
+# ---------------------
+# Host keys are NOT persistently cached.
+#
+# When an unknown SSH host key is encountered:
+#   SSH key requires acceptance press Y then Enter
+#
+# Once approved, the exact SHA256 fingerprint is remembered
+# ONLY for the current script run.
+#
+# This means:
+#   ui/ui   -> approve once
+#   ubnt/ubnt -> same fingerprint -> no second approval
+#
+# Close the script or move to another site and approval is
+# required again.
 # ============================================================
 
 $informUrl = "http://swatcloud.swatunifi.com:8080/inform"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$nmapExe   = Join-Path $scriptDir "nmap.exe"
-$plinkExe  = Join-Path $scriptDir "plink.exe"
-$logFile   = Join-Path $scriptDir ("adoption-log-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
+$nmapExe = Join-Path $scriptDir "nmap.exe"
+$plinkExe = Join-Path $scriptDir "plink.exe"
+$logFile = Join-Path $scriptDir ("adoption-log-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
+
+# Per-run SSH approval cache.
+# Keyed by the actual SSH fingerprint, not the IP address.
+$approvedHostKeys = @{}
 
 function Log {
     param(
         [string]$msg,
         [string]$Color = "White"
     )
+
     $line = "$(Get-Date -Format 'HH:mm:ss')  $msg"
     Write-Host $line -ForegroundColor $Color
     Add-Content -Path $logFile -Value $line
 }
 
-function New-PlinkSession {
-    # Talks to plink DIRECTLY (no cmd.exe wrapper, no file redirection) using
-    # .NET's own async pipe-based output capture. Combined with a real,
-    # visible window (CreateNoWindow = $false) - plink's interactive
-    # host-key prompt appears to need an actual console to behave properly
-    # on some machines; without one, its prompt text doesn't reliably reach
-    # a redirected file OR a redirected pipe. With a real window present,
-    # plink runs normally, and .NET's redirected streams still let us read
-    # and answer it programmatically instead of a human having to type.
-    param([string]$PlinkPath, [string]$ArgsLine)
+# ============================================================
+# SSH PROBE
+# ============================================================
+
+function Invoke-PlinkProbe {
+    param(
+        [string]$PlinkPath,
+        [string]$IpAddress,
+        [string]$User,
+        [string]$Pass
+    )
+
+    $argsLine = "-batch -ssh -pw `"$Pass`" `"$User@$IpAddress`""
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $PlinkPath
-    $psi.Arguments              = $ArgsLine
-    $psi.RedirectStandardInput  = $true
+    $psi.FileName = $PlinkPath
+    $psi.Arguments = $argsLine
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $false
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
+    try {
+        [void]$proc.Start()
+    }
+    catch {
+        return [PSCustomObject]@{
+            ExitCode = -1
+            Output = "Could not start Plink: $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        $proc.StandardInput.Close()
+    }
+    catch {}
+
+    $finished = $proc.WaitForExit(7000)
+
+    if (-not $finished) {
+        try { $proc.Kill() } catch {}
+        try { $proc.WaitForExit(1000) } catch {}
+
+        return [PSCustomObject]@{
+            ExitCode = -1
+            Output = "Plink probe timed out."
+        }
+    }
+
+    try {
+        $stdout = $proc.StandardOutput.ReadToEnd()
+    }
+    catch {
+        $stdout = ""
+    }
+
+    try {
+        $stderr = $proc.StandardError.ReadToEnd()
+    }
+    catch {
+        $stderr = ""
+    }
+
+    return [PSCustomObject]@{
+        ExitCode = $proc.ExitCode
+        Output = @($stdout, $stderr) -join "`n"
+    }
+}
+
+function Get-SshFingerprint {
+    param([string]$Text)
+
+    if ($Text -match 'SHA256:[A-Za-z0-9+/=]+') {
+        return $matches[0]
+    }
+
+    return $null
+}
+
+function Test-HostKeyMismatch {
+    param([string]$Text)
+
+    return (
+        ($Text -match "POTENTIAL SECURITY BREACH") -or
+        ($Text -match "WARNING - POTENTIAL SECURITY BREACH") -or
+        ($Text -match "host key.*changed") -or
+        ($Text -match "wrong host key") -or
+        ($Text -match "fingerprint.*does not match")
+    )
+}
+
+# ============================================================
+# SSH KEY APPROVAL
+# ============================================================
+
+function Confirm-SshHostKey {
+    param(
+        [string]$IpAddress,
+        [string]$Fingerprint
+    )
+
+    Write-Host ""
+    Write-Host "SSH key requires acceptance press Y then Enter" -ForegroundColor Yellow
+    Write-Host "Device: $IpAddress" -ForegroundColor Cyan
+    Write-Host "Fingerprint: $Fingerprint" -ForegroundColor Cyan
+    Write-Host ""
+
+    do {
+        $answer = Read-Host
+    }
+    while ($answer -notmatch '^[Yy]$')
+
+    return $true
+}
+
+# ============================================================
+# REAL PLINK SESSION
+# ============================================================
+
+function New-PlinkSession {
+    param(
+        [string]$PlinkPath,
+        [string]$IpAddress,
+        [string]$User,
+        [string]$Pass,
+        [string]$Fingerprint
+    )
+
+    $argsLine = "-batch -ssh -hostkey `"$Fingerprint`" -pw `"$Pass`" `"$User@$IpAddress`""
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $PlinkPath
+    $psi.Arguments = $argsLine
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     $proc.EnableRaisingEvents = $true
 
-    $buffer = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-    $action = { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add($EventArgs.Data) } }
-    $outSub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action $action -MessageData $buffer
-    $errSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -Action $action -MessageData $buffer
+    $buffer = [System.Collections.ArrayList]::Synchronized(
+        (New-Object System.Collections.ArrayList)
+    )
 
-    [void]$proc.Start()
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
+    $action = {
+        if ($EventArgs.Data -ne $null) {
+            [void]$Event.MessageData.Add($EventArgs.Data)
+        }
+    }
 
-    return [PSCustomObject]@{ Process = $proc; Buffer = $buffer; OutSub = $outSub; ErrSub = $errSub }
+    $outSub = Register-ObjectEvent `
+        -InputObject $proc `
+        -EventName OutputDataReceived `
+        -Action $action `
+        -MessageData $buffer
+
+    $errSub = Register-ObjectEvent `
+        -InputObject $proc `
+        -EventName ErrorDataReceived `
+        -Action $action `
+        -MessageData $buffer
+
+    try {
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+    }
+    catch {
+        try {
+            Unregister-Event -SourceIdentifier $outSub.Name -ErrorAction SilentlyContinue
+        }
+        catch {}
+
+        try {
+            Unregister-Event -SourceIdentifier $errSub.Name -ErrorAction SilentlyContinue
+        }
+        catch {}
+
+        throw
+    }
+
+    return [PSCustomObject]@{
+        Process = $proc
+        Buffer = $buffer
+        OutSub = $outSub
+        ErrSub = $errSub
+    }
 }
 
-function Get-SessionText { param($Session) return ($Session.Buffer -join "`n") }
+function Get-SessionText {
+    param($Session)
+    return ($Session.Buffer -join "`n")
+}
 
 function Close-PlinkSession {
     param($Session)
-    try { if (-not $Session.Process.HasExited) { $Session.Process.Kill() } } catch {}
-    try { Unregister-Event -SourceIdentifier $Session.OutSub.Name -ErrorAction SilentlyContinue } catch {}
-    try { Unregister-Event -SourceIdentifier $Session.ErrSub.Name -ErrorAction SilentlyContinue } catch {}
-    try { Remove-Job $Session.OutSub -Force -ErrorAction SilentlyContinue } catch {}
-    try { Remove-Job $Session.ErrSub -Force -ErrorAction SilentlyContinue } catch {}
-}
 
-function Wait-ForSessionPattern {
-    # Polls every $PollMs until $Pattern shows up in the session's output,
-    # or $TimeoutMs elapses - whichever is first. Returns as soon as it
-    # sees a real answer rather than waiting out the full timeout every time.
-    param($Session, [string]$Pattern, [int]$TimeoutMs, [int]$PollMs = 150)
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
-        if ((Get-SessionText $Session) -match $Pattern) { return $true }
-        if ($Session.Process.HasExited) { break }
-        Start-Sleep -Milliseconds $PollMs
+    try {
+        if (-not $Session.Process.HasExited) {
+            $Session.Process.Kill()
+        }
     }
-    return (Get-SessionText $Session) -match $Pattern
+    catch {}
+
+    try {
+        Unregister-Event -SourceIdentifier $Session.OutSub.Name -ErrorAction SilentlyContinue
+    }
+    catch {}
+
+    try {
+        Unregister-Event -SourceIdentifier $Session.ErrSub.Name -ErrorAction SilentlyContinue
+    }
+    catch {}
+
+    try {
+        Remove-Job $Session.OutSub -Force -ErrorAction SilentlyContinue
+    }
+    catch {}
+
+    try {
+        Remove-Job $Session.ErrSub -Force -ErrorAction SilentlyContinue
+    }
+    catch {}
 }
 
 function Invoke-PlinkInteractive {
@@ -91,93 +284,115 @@ function Invoke-PlinkInteractive {
         [string]$IpAddress,
         [string]$User,
         [string]$Pass,
+        [string]$Fingerprint,
         [string[]]$Commands,
-        [int]$ConnectTimeoutMs  = 5000,   # cap while waiting for a host-key prompt / auth result / banner
-        [int]$CommandGapMs      = 700,    # pause between typed commands once logged in
-        [int]$OverallTimeoutMs  = 9000    # absolute worst-case cap for the whole session
+        [int]$OverallTimeoutMs = 15000,
+        [int]$CommandGapMs = 700
     )
 
-    $session = New-PlinkSession -PlinkPath $PlinkPath -ArgsLine "-ssh -pw `"$Pass`" `"$User@$IpAddress`""
+    $session = New-PlinkSession `
+        -PlinkPath $PlinkPath `
+        -IpAddress $IpAddress `
+        -User $User `
+        -Pass $Pass `
+        -Fingerprint $Fingerprint
 
-    # Wait for whichever comes first: an unknown-host-key prompt, an auth
-    # rejection, or the device's own login banner (meaning auth succeeded).
-    Wait-ForSessionPattern -Session $session -TimeoutMs $ConnectTimeoutMs `
-        -Pattern "(Store key in cache|Access denied|FATAL ERROR|not accepted|Welcome to)" | Out-Null
-    $text = Get-SessionText $session
+    Start-Sleep -Milliseconds 500
 
-    if ($text -match "Store key in cache") {
-        try { $session.Process.StandardInput.WriteLine("y"); $session.Process.StandardInput.Flush() } catch {}
-        # This device has never been trusted before - now wait for the real
-        # outcome (auth rejection or banner) that follows the key acceptance.
-        Wait-ForSessionPattern -Session $session -TimeoutMs $ConnectTimeoutMs `
-            -Pattern "(Access denied|FATAL ERROR|not accepted|Welcome to)" | Out-Null
-        $text = Get-SessionText $session
-    }
-
-    if ($text -notmatch "Access denied|FATAL ERROR|not accepted") {
-        foreach ($cmd in $Commands) {
-            try { $session.Process.StandardInput.WriteLine($cmd); $session.Process.StandardInput.Flush() } catch {}
-            Start-Sleep -Milliseconds $CommandGapMs
-        }
+    foreach ($cmd in $Commands) {
         try {
-            $session.Process.StandardInput.WriteLine("exit")
+            $session.Process.StandardInput.WriteLine($cmd)
             $session.Process.StandardInput.Flush()
-            $session.Process.StandardInput.Close()
-        } catch {}
+        }
+        catch {
+            break
+        }
+
+        Start-Sleep -Milliseconds $CommandGapMs
     }
+
+    try {
+        $session.Process.StandardInput.WriteLine("exit")
+        $session.Process.StandardInput.Flush()
+        $session.Process.StandardInput.Close()
+    }
+    catch {}
 
     $exited = $session.Process.WaitForExit($OverallTimeoutMs)
     $exitCode = -1
-    if ($exited) { $exitCode = $session.Process.ExitCode }
-    $finalText = Get-SessionText $session
 
+    if ($exited) {
+        $exitCode = $session.Process.ExitCode
+    }
+
+    Start-Sleep -Milliseconds 200
+
+    $finalText = Get-SessionText $session
     Close-PlinkSession $session
 
     return [PSCustomObject]@{
         ExitCode = $exitCode
-        Output   = $finalText
+        Output = $finalText
         TimedOut = -not $exited
     }
 }
+
+# ============================================================
+# MAIN
+# ============================================================
 
 try {
     Log "=== SWATCloud UniFi Auto-Adopt Tool ===" -Color Blue
     Log "Inform URL: $informUrl" -Color Cyan
     Log "Script folder: $scriptDir" -Color Cyan
 
-    # --- 0. Sanity check the required tools are present ---
+    # --------------------------------------------------------
+    # 0. CHECK REQUIRED TOOLS
+    # --------------------------------------------------------
+
     if (-not (Test-Path $nmapExe)) {
-        Log "ERROR: nmap.exe not found in this folder. Copy it in alongside this script and try again."
-        return -Color Red
-    }
-    if (-not (Test-Path $plinkExe)) {
-        Log "ERROR: plink.exe not found in this folder. Copy it in alongside this script and try again."
-        return -Color Red
-    }
-
-    # --- 1. Detect the active local subnet (varies per site) ---
-    $activeConfig = Get-NetIPConfiguration -ErrorAction Stop | Where-Object {
-        $_.IPv4DefaultGateway -ne $null -and
-        $_.NetAdapter.Status -eq "Up"
-    } | Select-Object -First 1
-
-    if (-not $activeConfig) {
-        Log "ERROR: Could not detect an active network connection."
-        Log "Make sure this laptop is connected to the site network (wired or WiFi) and try again."
+        Log "ERROR: nmap.exe not found in this folder. Copy it in alongside this script and try again." -Color Red
         return
     }
 
-    $ipAddress    = $activeConfig.IPv4Address.IPAddress
+    if (-not (Test-Path $plinkExe)) {
+        Log "ERROR: plink.exe not found in this folder. Copy it in alongside this script and try again." -Color Red
+        return
+    }
+
+    # --------------------------------------------------------
+    # 1. DETECT ACTIVE LOCAL SUBNET
+    # --------------------------------------------------------
+
+    $activeConfig = Get-NetIPConfiguration -ErrorAction Stop |
+        Where-Object {
+            $_.IPv4DefaultGateway -ne $null -and
+            $_.NetAdapter.Status -eq "Up"
+        } |
+        Select-Object -First 1
+
+    if (-not $activeConfig) {
+        Log "ERROR: Could not detect an active network connection." -Color Red
+        Log "Make sure this laptop is connected to the site network (wired or WiFi) and try again." -Color Red
+        return
+    }
+
+    $ipAddress = $activeConfig.IPv4Address.IPAddress
     $prefixLength = $activeConfig.IPv4Address.PrefixLength
-    $cidr         = "$ipAddress/$prefixLength"
+    $cidr = "$ipAddress/$prefixLength"
 
     Log "Detected local network: $cidr  (adapter: $($activeConfig.InterfaceAlias))" -Color Cyan
 
-    # --- 2. Scan for hosts with SSH open (factory-default UniFi devices) ---
+    # --------------------------------------------------------
+    # 2. SCAN FOR DEVICES WITH SSH
+    # --------------------------------------------------------
+
     Log "Scanning for devices with SSH... this can take a minute or two." -Color Cyan
+
     $nmapOutput = & $nmapExe -Pn -p 22 --open -oG - $cidr 2>&1
 
     $targets = New-Object System.Collections.Generic.List[string]
+
     foreach ($line in $nmapOutput) {
         if ($line -match "^Host:\s+(\d+\.\d+\.\d+\.\d+).*Ports:\s+22/open") {
             $targets.Add($matches[1])
@@ -185,74 +400,221 @@ try {
     }
 
     if ($targets.Count -eq 0) {
-        Log "No devices with SSH open were found on $cidr."
-        Log "Nothing to adopt right now. If you expected devices here, double-check they're powered on and on this same network."
+        Log "No devices with SSH open were found on $cidr." -Color Red
+        Log "Nothing to adopt right now. If you expected devices here, double-check they're powered on and on this same network." -Color Red
         Log "--- Raw nmap output (for troubleshooting) ---"
-        foreach ($line in $nmapOutput) { Log "    $line" }
+
+        foreach ($line in $nmapOutput) {
+            Log "    $line"
+        }
+
         return
     }
 
     Log "Found $($targets.Count) candidate device(s), attempting to set inform on each: $($targets -join ', ')" -Color Green
 
-    # --- 3. Try default UniFi credentials, push set-inform on success ---
-    $credPairs = @(
-        @{ User = "ui";   Pass = "ui" },      # newer devices
-        @{ User = "ubnt"; Pass = "ubnt" }   # older devices
+    # --------------------------------------------------------
+    # 3. DEFAULT UNIFI CREDENTIALS
+    # --------------------------------------------------------
 
+    $credPairs = @(
+        @{ User = "ui"; Pass = "ui" }
+        @{ User = "ubnt"; Pass = "ubnt" }
     )
 
     $adoptedCount = 0
 
+    # --------------------------------------------------------
+    # 4. PROCESS EACH DEVICE
+    # --------------------------------------------------------
+
     foreach ($ip in $targets) {
         $adopted = $false
+
         foreach ($cred in $credPairs) {
             Log "Trying $ip with $($cred.User)/$($cred.Pass)..."
 
-            # Open a real interactive session and TYPE the commands in with
-            # pauses between each, the way a human at a terminal would.
-            # Some newer UniFi firmware only recognises "set-inform" inside
-            # its interactive management shell - and needs time to reach a
-            # prompt before it will accept any input at all.
-            $result = Invoke-PlinkInteractive -PlinkPath $plinkExe -IpAddress $ip `
-                -User $cred.User -Pass $cred.Pass `
-                -Commands @("set-inform $informUrl", "set-inform $informUrl")
+            # ------------------------------------------------
+            # GET SSH HOST KEY FINGERPRINT
+            # ------------------------------------------------
 
-            $exitCode   = $result.ExitCode
+            $probe = Invoke-PlinkProbe `
+                -PlinkPath $plinkExe `
+                -IpAddress $ip `
+                -User $cred.User `
+                -Pass $cred.Pass
+
+            $probeText = $probe.Output
+
+            Add-Content -Path $logFile -Value @"
+----- SSH probe for $ip ($($cred.User)/$($cred.Pass)) -----
+$probeText
+----- End SSH probe -----
+"@
+
+            # ------------------------------------------------
+            # CHECK FOR HOST KEY MISMATCH
+            # ------------------------------------------------
+
+            if (Test-HostKeyMismatch $probeText) {
+                Log "  -> ${ip}: SSH host key mismatch/security warning. NOT connecting." -Color Red
+                break
+            }
+
+            # ------------------------------------------------
+            # EXTRACT FINGERPRINT
+            # ------------------------------------------------
+
+            $fingerprint = Get-SshFingerprint $probeText
+
+            if (-not $fingerprint) {
+                if (
+                    ($probeText -match "Access denied") -or
+                    ($probeText -match "Authentication refused") -or
+                    ($probeText -match "No supported authentication")
+                ) {
+                    Log "    Login rejected for $($cred.User)/$($cred.Pass)." -Color Yellow
+                    continue
+                }
+
+                Log "    Could not determine SSH host-key fingerprint for $ip." -Color Yellow
+                Log "    Plink probe output has been saved to the log." -Color Yellow
+                continue
+            }
+
+            # ------------------------------------------------
+            # CHECK PER-RUN APPROVAL CACHE
+            #
+            # Keyed by fingerprint, NOT IP.
+            #
+            # Same fingerprint:
+            #   Already approved -> no prompt.
+            #
+            # Different fingerprint:
+            #   New SSH identity -> prompt.
+            #
+            # Nothing survives after the script exits.
+            # ------------------------------------------------
+
+            $keyAlreadyApproved = $approvedHostKeys.ContainsKey($fingerprint)
+
+            if ($keyAlreadyApproved) {
+                Log "    SSH key already approved this run: $fingerprint" -Color Cyan
+            }
+            else {
+                $approved = Confirm-SshHostKey `
+                    -IpAddress $ip `
+                    -Fingerprint $fingerprint
+
+                if (-not $approved) {
+                    Log "  -> ${ip}: SSH key was not accepted. Skipping device." -Color Yellow
+                    break
+                }
+
+                $approvedHostKeys[$fingerprint] = $true
+
+                Log "    SSH key approved for this run: $fingerprint" -Color Cyan
+            }
+
+            # ------------------------------------------------
+            # CONNECT USING APPROVED FINGERPRINT
+            # ------------------------------------------------
+
+            $result = Invoke-PlinkInteractive `
+                -PlinkPath $plinkExe `
+                -IpAddress $ip `
+                -User $cred.User `
+                -Pass $cred.Pass `
+                -Fingerprint $fingerprint `
+                -Commands @(
+                    "set-inform $informUrl",
+                    "set-inform $informUrl"
+                )
+
+            $exitCode = $result.ExitCode
             $outputText = $result.Output
 
-            $authFailed = ($outputText -match "Access denied") -or
-                          ($outputText -match "not accepted") -or
-                          ($outputText -match "No supported authentication")
+            Add-Content -Path $logFile -Value @"
+----- Full transcript for $ip ($($cred.User)/$($cred.Pass)) -----
+Host key fingerprint: $fingerprint
+Exit code: $exitCode
+$outputText
+----- End transcript -----
+"@
 
-            Add-Content -Path $logFile -Value "----- Full transcript for $ip ($($cred.User)/$($cred.Pass)) -----`n$outputText`n----- End transcript -----"
+            # ------------------------------------------------
+            # AUTHENTICATION FAILURE
+            # ------------------------------------------------
+
+            $authFailed =
+                ($outputText -match "Access denied") -or
+                ($outputText -match "Authentication refused") -or
+                ($outputText -match "No supported authentication")
+
+            if ($authFailed) {
+                Log "    (exit code $exitCode) - Login rejected for $($cred.User)/$($cred.Pass)." -Color Yellow
+                continue
+            }
+
+            # ------------------------------------------------
+            # TIMEOUT
+            # ------------------------------------------------
 
             if ($result.TimedOut) {
-                Log "     TIMED OUT waiting for a response from $ip - moving on. (Check the laptop's firewall/antivirus isn't blocking plink.exe or outbound SSH.)"
-            } elseif (-not $authFailed) {
-                Log "  -> ${ip}: logged in and sent set-inform to SWAT CLOUD." -Color Green
-                if ($outputText -match "not found") {
-                    Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device."
-                }
-                $adopted = $true
-                $adoptedCount++
-                break
-            } else {
-                Log "     (exit code $exitCode) - Computer says no. Login rejected." -Color Yellow
+                Log "    TIMED OUT waiting for a response from $ip - moving on." -Color Yellow
+                continue
             }
+
+            # ------------------------------------------------
+            # PLINK FAILURE
+            # ------------------------------------------------
+
+            if ($exitCode -ne 0) {
+                Log "    Plink returned exit code $exitCode for $ip. Connection/adoption was NOT confirmed." -Color Yellow
+                continue
+            }
+
+            # ------------------------------------------------
+            # NO OUTPUT
+            # ------------------------------------------------
+
+            if ([string]::IsNullOrWhiteSpace($outputText)) {
+                Log "    Plink exited successfully but produced no session output. Adoption NOT reported as confirmed." -Color Yellow
+                continue
+            }
+
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
+
+            Log "  -> ${ip}: logged in and sent set-inform to SWAT CLOUD." -Color Green
+
+            if ($outputText -match "not found") {
+                Log "     NOTE: device echoed 'not found' for something in the session - check the log file for the full transcript on this device." -Color Yellow
+            }
+
+            $adopted = $true
+            $adoptedCount++
+            break
         }
+
         if (-not $adopted) {
             Log "  -> Could not log into $ip." -Color Red
         }
     }
+
+    # --------------------------------------------------------
+    # COMPLETE
+    # --------------------------------------------------------
 
     Log "=== Done. $adoptedCount of $($targets.Count) device(s) were sent set-inform to SWAT CLOUD. ===" -Color Green
     Log "Check the Swat Cloud console - devices should now show 'Pending Adoption' within a minute or two." -Color Green
     Log "Full log saved to: $logFile" -Color Cyan
 }
 catch {
-    Log "!!! UNEXPECTED ERROR !!!"
-    Log $_.Exception.Message
-    Log $_.ScriptStackTrace
+    Log "!!! UNEXPECTED ERROR !!!" -Color Red
+    Log $_.Exception.Message -Color Red
+    Log $_.ScriptStackTrace -Color Red
 }
 finally {
     Write-Host ""
