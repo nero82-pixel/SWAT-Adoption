@@ -1,0 +1,75 @@
+SWAT CLOUD UNIFI AUTO-ADOPT TOOL
+=================================
+
+WHAT THIS DOES
+--------------
+A tech double-clicks "Run-Scan.bat". It:
+  1. Detects whatever local network the laptop is currently on (works on
+     any site, any IP range - no editing needed).
+  2. Scans that network for factory-default UniFi devices (anything with
+     SSH open).
+  3. Logs into each one with default UniFi credentials and runs
+     set-inform http://swatcloud.swatunifi.com:8080/inform
+     automatically, twice, for reliability.
+  4. Prints a log on screen and saves it to a text file in this folder.
+
+Devices should then appear as "Pending Adoption" in the Swat Cloud
+console within a minute or two, ready to be adopted as normal.
+
+
+ONE-TIME SETUP (do this once, then zip the whole folder and hand it out)
+--------------------------------------------------------------------------
+This folder needs two small free tools added to it before it's ready.
+They are NOT included here because they're third-party binaries you
+should grab directly from their official sources:
+
+1. NMAP (network scanner)
+   - Download the "Nmap for Windows" zip from https://nmap.org/download.html
+   - Extract it, find "nmap.exe", copy it into THIS folder
+     (the same folder as Run-Scan.bat).
+   - Note: this tool only needs nmap's basic TCP connect scan, so the
+     separate Npcap driver installer that the full Nmap installer offers
+     is NOT required - just the .exe.
+
+2. PLINK (command-line SSH client from the PuTTY suite)
+   - Download "plink.exe" directly from
+     https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html
+   - Copy plink.exe into THIS folder too.
+
+Once both .exe files sit next to Scan-And-Adopt.ps1 and Run-Scan.bat,
+zip the whole folder. That zip is what you hand to techs - nothing
+else needs installing on their laptop, no admin rights needed, works
+on Windows Home or Pro.
+
+
+DEPLOYING TO TECHS
+-------------------
+- Unzip the folder in a directory with read and write permissions(Desktop is fine).
+Install VCredist 64 and 86 both.
+- Tech connects the laptop to the site's network (wired or WiFi).
+- Tech double-clicks Run-Scan.bat.
+- A window opens, shows progress, and pauses at the end so they can
+  read the result before closing it.
+
+
+TROUBLESHOOTING
+----------------
+- "No devices found": device may not be in factory-default state, may
+  already be adopted, or isn't on the same network segment as the
+  laptop (e.g. it's on a separate VLAN/switch the laptop can't reach).
+- "Could not log into X with default credentials": the device likely
+  already has custom SSH credentials, meaning it's probably already
+  adopted somewhere or was previously configured.
+- If Windows blocks Run-Scan.bat as an unrecognized app (SmartScreen),
+  right-click Run-Scan.bat -> Properties -> tick "Unblock" -> OK. This
+  is expected the first time on a new laptop and is a one-off per PC.
+- The script needs no admin rights and makes no permanent changes to
+  the laptop it runs on.
+
+
+UPDATING THE INFORM URL LATER
+-------------------------------
+If the cloud controller address ever changes, open Scan-And-Adopt.ps1
+in Notepad and edit this single line near the top:
+    $informUrl = "http://swatcloud.swatunifi.com:8080/inform"
+Save, re-zip, redistribute.
